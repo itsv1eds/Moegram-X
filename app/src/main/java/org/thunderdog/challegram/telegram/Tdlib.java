@@ -23,6 +23,7 @@ import android.os.SystemClock;
 import android.widget.Toast;
 
 import androidx.annotation.AnyThread;
+import androidx.annotation.DrawableRes;
 import androidx.annotation.IntDef;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -97,6 +98,8 @@ import me.vkryl.core.BitwiseUtils;
 import me.vkryl.core.FileUtils;
 import me.vkryl.core.MathUtils;
 import me.vkryl.core.StringUtils;
+import me.vkryl.core.collection.LongList;
+import me.vkryl.core.collection.LongSet;
 import me.vkryl.core.collection.LongSparseIntArray;
 import me.vkryl.core.collection.LongSparseLongArray;
 import me.vkryl.core.lambda.CancellableRunnable;
@@ -496,6 +499,9 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
   private int maxMessageTextLength = 4000;
 
   private int installedStickerSetLimit = 200;
+
+  private long chatFilterCountMax = 10;
+  private long chatFilterChosenChatCountMax = 100;
 
   private boolean disableContactRegisteredNotifications = false;
 
@@ -1672,6 +1678,14 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     client().send(function, handler);
   }
 
+  public <T extends TdApi.Object> void send (TdApi.Function<T> function, Class<T> resultClass) {
+    client().send(function, resultHandler(resultClass));
+  }
+
+  public <T extends TdApi.Object> void send (TdApi.Function<T> function, Class<T> resultClass, RunnableData<T> onResult, RunnableData<TdApi.Error> onError) {
+    client().send(function, resultHandler(resultClass, onResult, onError));
+  }
+
   public void sendAll (TdApi.Function<?>[] functions, Client.ResultHandler handler, @Nullable Runnable after) {
     if (functions.length == 0) {
       if (after != null) {
@@ -2236,6 +2250,34 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     } : okHandler();
   }
 
+  public <T extends TdApi.Object> Client.ResultHandler resultHandler (Class<T> resultClass) {
+    return resultHandler(resultClass, null);
+  }
+
+  public <T extends TdApi.Object> Client.ResultHandler resultHandler (Class<T> resultClass, @Nullable Runnable onResult) {
+    return resultHandler(resultClass, onResult != null ? (result) -> onResult.run() : null, null);
+  }
+
+  public <T extends TdApi.Object> Client.ResultHandler resultHandler (Class<T> resultClass, @Nullable RunnableData<T> onResult, @Nullable RunnableData<TdApi.Error> onError) {
+    return object -> {
+      if (resultClass.isInstance(object)) {
+        if (onResult != null) {
+          T result = resultClass.cast(object);
+          tdlib().ui().post(() -> onResult.runWithData(result));
+        }
+      } else if (object.getConstructor() == TdApi.Error.CONSTRUCTOR) {
+        if (onError != null) {
+          TdApi.Error error = (TdApi.Error) object;
+          tdlib().ui().post(() -> onError.runWithData(error));
+        } else {
+          UI.showError(object);
+        }
+      } else {
+        Log.unexpectedTdlibResponse(object, null, resultClass, TdApi.Error.class);
+      }
+    };
+  }
+
   public Client.ResultHandler doneHandler () {
     return doneHandler;
   }
@@ -2327,7 +2369,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     if (chatIds == null || chatIds.length == 0)
       return;
     if (after != null) {
-      int[] counter = new int[]{chatIds.length};
+      int[] counter = new int[] {chatIds.length};
       for (long chatId : chatIds) {
         client().send(new TdApi.GetChat(chatId), result -> {
           silentHandler.onResult(result);
@@ -3185,16 +3227,28 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     }
   }
 
-  public TdApi.ChatFilterInfo chatFilterInfo (int chatFilterId) {
+  public int mainChatListPosition () {
     synchronized (dataLock) {
-      if (chatFilters != null) {
-        for (TdApi.ChatFilterInfo filter : chatFilters) {
-          if (filter.id == chatFilterId)
-            return filter;
-        }
-      }
+      return mainChatListPosition;
     }
-    return null;
+  }
+
+  public int chatFilterCount () {
+    synchronized (dataLock) {
+      return chatFilters.length;
+    }
+  }
+
+  public TdApi.ChatFilterInfo[] chatFilterInfos () {
+    synchronized (dataLock) {
+      return chatFilters;
+    }
+  }
+
+  public @Nullable TdApi.ChatFilterInfo chatFilterInfo (int chatFilterId) {
+    synchronized (dataLock) {
+      return chatFiltersById.get(chatFilterId);
+    }
   }
 
   public boolean canArchiveChat (TdApi.ChatList chatList, TdApi.Chat chat) {
@@ -6459,6 +6513,14 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     return antiSpamBotUserId;
   }
 
+  public long chatFilterCountMax () {
+    return chatFilterCountMax;
+  }
+
+  public long chatFilterChosenChatCountMax () {
+    return chatFilterChosenChatCountMax;
+  }
+
   public @ConnectionState int connectionState () {
     return connectionState;
   }
@@ -7346,12 +7408,22 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     listeners.updateChatAvailableReactions(update);
   }
 
-  private TdApi.ChatFilterInfo[] chatFilters;
+  private int mainChatListPosition;
+  private TdApi.ChatFilterInfo[] chatFilters = new TdApi.ChatFilterInfo[0];
+  private final SparseArrayCompat<TdApi.ChatFilterInfo> chatFiltersById = new SparseArrayCompat<>();
 
   @TdlibThread
   private void updateChatFilters (TdApi.UpdateChatFilters update) {
     synchronized (dataLock) {
-      this.chatFilters = update.chatFilters;
+      TdApi.ChatFilterInfo[] chatFilters = update.chatFilters;
+      this.chatFilters = chatFilters;
+      this.chatFiltersById.clear();
+      if (chatFilters != null) {
+        for (TdApi.ChatFilterInfo chatFilter : chatFilters) {
+          this.chatFiltersById.put(chatFilter.id, chatFilter);
+        }
+      }
+      this.mainChatListPosition = update.mainChatListPosition;
     }
     listeners.updateChatFilters(update);
   }
@@ -8003,7 +8075,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
   }
 
   @TdlibThread
-  private boolean setUnreadChatCounters(@NonNull TdApi.ChatList chatList, int totalCount, int unreadChatCount, int unreadUnmutedCount, int markedAsUnreadCount, int markedAsUnreadUnmutedCount) {
+  private boolean setUnreadChatCounters (@NonNull TdApi.ChatList chatList, int totalCount, int unreadChatCount, int unreadUnmutedCount, int markedAsUnreadCount, int markedAsUnreadUnmutedCount) {
     TdlibCounter counter = getCounter(chatList);
 
     int oldUnreadCount = Math.max(counter.chatCount, 0);
@@ -8068,7 +8140,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
         long longValue = ((TdApi.OptionValueInteger) update.value).value;
 
         if (Log.isEnabled(Log.TAG_TDLIB_OPTIONS)) {
-          Log.v(Log.TAG_TDLIB_OPTIONS,"optionInteger %s -> %d", name, longValue);
+          Log.v(Log.TAG_TDLIB_OPTIONS, "optionInteger %s -> %d", name, longValue);
         }
 
         switch (name) {
@@ -8128,6 +8200,12 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
           case "favorite_stickers_limit":
             this.favoriteStickersMaxCount = (int) longValue;
             break;
+          case "chat_filter_count_max":
+            this.chatFilterCountMax = longValue;
+            break;
+          case "chat_filter_chosen_chat_count_max":
+            this.chatFilterChosenChatCountMax = longValue;
+            break;
         }
 
         break;
@@ -8137,7 +8215,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
         boolean boolValue = ((TdApi.OptionValueBoolean) update.value).value;
 
         if (Log.isEnabled(Log.TAG_TDLIB_OPTIONS)) {
-          Log.v(Log.TAG_TDLIB_OPTIONS,"optionBool %s -> %b", name, boolValue);
+          Log.v(Log.TAG_TDLIB_OPTIONS, "optionBool %s -> %b", name, boolValue);
         }
 
         switch (name) {
@@ -8205,7 +8283,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
       }
       case TdApi.OptionValueEmpty.CONSTRUCTOR: {
         if (Log.isEnabled(Log.TAG_TDLIB_OPTIONS)) {
-          Log.v(Log.TAG_TDLIB_OPTIONS,"optionEmpty %s -> empty", name);
+          Log.v(Log.TAG_TDLIB_OPTIONS, "optionEmpty %s -> empty", name);
         }
 
         switch (name) {
@@ -9107,7 +9185,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
 
   // Emoji
 
-  void fetchAllMessages (long chatId, @Nullable String query, @Nullable TdApi.SearchMessagesFilter filter,  @NonNull RunnableData<List<TdApi.Message>> callback) {
+  void fetchAllMessages (long chatId, @Nullable String query, @Nullable TdApi.SearchMessagesFilter filter, @NonNull RunnableData<List<TdApi.Message>> callback) {
     List<TdApi.Message> messages = new ArrayList<>();
     boolean needFilter = !StringUtils.isEmpty(query) || filter != null;
     TdApi.Function<?> function;
@@ -10040,7 +10118,7 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
 
   public boolean haveAnySettingsSuggestions () {
     synchronized (dataLock) {
-      for (TdApi.SuggestedAction action: suggestedActions) {
+      for (TdApi.SuggestedAction action : suggestedActions) {
         if (isSettingSuggestion(action))
           return true;
       }
@@ -10072,5 +10150,137 @@ public class Tdlib implements TdlibProvider, Settings.SettingsChangeListener {
     } else {
       return chatTitle(Td.getSenderId(sender));
     }
+  }
+
+  public String chatFilterIconName (TdApi.ChatFilter chatFilter) {
+    if (!StringUtils.isEmpty(chatFilter.iconName))
+      return chatFilter.iconName;
+    TdApi.Object result = clientExecute(new TdApi.GetChatFilterDefaultIconName(chatFilter), 0);
+    if (result != null && result.getConstructor() == TdApi.Text.CONSTRUCTOR) {
+      return ((TdApi.Text) result).text;
+    }
+    return "";
+  }
+
+  public @DrawableRes int chatFilterIcon (TdApi.ChatFilter chatFilter, @DrawableRes int defaultIcon) {
+    return TD.iconByName(chatFilterIconName(chatFilter), defaultIcon);
+  }
+
+  public void addChatsToChatFilter (TdlibDelegate delegate, int chatFilterId, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    send(new TdApi.GetChatFilter(chatFilterId), (result) -> {
+      switch (result.getConstructor()) {
+        case TdApi.ChatFilter.CONSTRUCTOR:
+          addChatsToChatFilter(delegate, chatFilterId, (TdApi.ChatFilter) result, chatIds);
+          break;
+        case TdApi.Error.CONSTRUCTOR:
+          UI.showError(result);
+          break;
+        default:
+          Log.unexpectedTdlibResponse(result, TdApi.GetChatFilter.class, TdApi.ChatFilter.class, TdApi.Error.class);
+          break;
+      }
+    });
+  }
+
+  public void addChatsToChatFilter (TdlibDelegate delegate, int chatFilterId, TdApi.ChatFilter chatFilter, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    LongSet pinnedChatIds = new LongSet(chatFilter.pinnedChatIds);
+    LongSet includedChatIds = new LongSet(chatFilter.includedChatIds);
+    for (long chatId : chatIds) {
+      if (pinnedChatIds.has(chatId) || includedChatIds.has(chatId)) {
+        continue;
+      }
+      includedChatIds.add(chatId);
+    }
+    if (includedChatIds.size() == chatFilter.includedChatIds.length) {
+      return;
+    }
+    int chatCount = pinnedChatIds.size() + includedChatIds.size();
+    int secretChatCount = 0;
+    for (long pinnedChatId : pinnedChatIds) {
+      if (ChatId.isSecret(pinnedChatId)) secretChatCount++;
+    }
+    for (long includedChatId : includedChatIds) {
+      if (ChatId.isSecret(includedChatId)) secretChatCount++;
+    }
+    int nonSecretChatCount = chatCount - secretChatCount;
+    long chosenChatCountMax = tdlib().chatFilterChosenChatCountMax();
+    if (secretChatCount > chosenChatCountMax || nonSecretChatCount > chosenChatCountMax) {
+      if (hasPremium()) {
+        CharSequence text = Lang.getMarkdownString(delegate, R.string.ChatsInFolderLimitReached, chosenChatCountMax);
+        UI.showCustomToast(text, Toast.LENGTH_LONG, 0);
+      } else {
+        send(new TdApi.GetPremiumLimit(new TdApi.PremiumLimitTypeChatFilterChosenChatCount()), (result) -> {
+          CharSequence text;
+          if (result.getConstructor() == TdApi.PremiumLimit.CONSTRUCTOR) {
+            TdApi.PremiumLimit premiumLimit = (TdApi.PremiumLimit) result;
+            text = Lang.getMarkdownString(delegate, R.string.PremiumRequiredChatsInFolder, premiumLimit.defaultValue, premiumLimit.premiumValue);
+          } else {
+            text = Lang.getMarkdownString(delegate, R.string.ChatsInFolderLimitReached, chosenChatCountMax);
+          }
+          UI.showCustomToast(text, Toast.LENGTH_LONG, 0);
+        });
+      }
+      return;
+    }
+    chatFilter.includedChatIds = includedChatIds.toArray();
+    chatFilter.excludedChatIds = ArrayUtils.removeAll(chatFilter.excludedChatIds, chatIds);
+    send(new TdApi.EditChatFilter(chatFilterId, chatFilter), TdApi.ChatFilterInfo.class);
+  }
+
+  public void removeChatFromChatFilter (int chatFilterId, long chatId) {
+    removeChatsFromChatFilter(chatFilterId, new long[] {chatId});
+  }
+
+  public void removeChatsFromChatFilter (int chatFilterId, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    send(new TdApi.GetChatFilter(chatFilterId), (result) -> {
+      switch (result.getConstructor()) {
+        case TdApi.ChatFilter.CONSTRUCTOR:
+          removeChatsFromChatFilter(chatFilterId, (TdApi.ChatFilter) result, chatIds);
+          break;
+        case TdApi.Error.CONSTRUCTOR:
+          UI.showError(result);
+          break;
+        default:
+          Log.unexpectedTdlibResponse(result, TdApi.GetChatFilter.class, TdApi.ChatFilter.class, TdApi.Error.class);
+          break;
+      }
+    });
+  }
+
+  public void removeChatsFromChatFilter (int chatFilterId, TdApi.ChatFilter chatFilter, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    LongList pinnedChatIds = new LongList(chatFilter.pinnedChatIds);
+    LongSet includedChatIds = new LongSet(chatFilter.includedChatIds);
+    LongSet excludedChatIds = new LongSet(chatFilter.excludedChatIds);
+    for (long chatId : chatIds) {
+       boolean removed = pinnedChatIds.remove(chatId) | includedChatIds.remove(chatId);
+       if (removed && Config.CHAT_FOLDERS_SMART_CHAT_DELETION_ENABLED) {
+         TdApi.Chat chat = chat(chatId);
+         boolean isBotChat = isBotChat(chat);
+         boolean isUserChat = isUserChat(chat) && !isBotChat;
+         boolean isContactChat = isUserChat && TD.isContact(chatUser(chat));
+         if (!chatFilter.includeContacts && isUserChat && isContactChat) continue;
+         if (!chatFilter.includeNonContacts && isUserChat && !isContactChat) continue;
+         if (!chatFilter.includeGroups && TD.isMultiChat(chat)) continue;
+         if (!chatFilter.includeChannels && isChannelChat(chat)) continue;
+         if (!chatFilter.includeBots && isBotChat) continue;
+       }
+       excludedChatIds.add(chatId);
+    }
+    chatFilter.pinnedChatIds = pinnedChatIds.get();
+    chatFilter.includedChatIds = includedChatIds.toArray();
+    chatFilter.excludedChatIds = excludedChatIds.toArray();
+    send(new TdApi.EditChatFilter(chatFilterId, chatFilter), TdApi.ChatFilterInfo.class);
   }
 }
